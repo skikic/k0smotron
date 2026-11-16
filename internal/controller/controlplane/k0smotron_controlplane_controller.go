@@ -22,14 +22,11 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
-	"reflect"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/imdario/mergo"
 	corev1 "k8s.io/api/core/v1"
-	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -421,11 +418,8 @@ func (c *K0smotronController) reconcile(ctx context.Context, cluster *clusterv1.
 		kcp.Spec.ExternalAddress = foundCluster.Spec.ExternalAddress
 	}
 
-	isClusterSpecSynced, kcpSpecHash, err := isClusterSpecSynced(foundCluster, kcp.Spec)
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("error comparing cluster spec between k0smotron.Cluster and k0smotronControlPlane: %w", err)
-	}
-	if !isClusterSpecSynced {
+	isSynced, kcpSpecHash := isClusterSpecHashSynced(foundCluster, kcp.Spec)
+	if !isSynced {
 		patchHelper, err := patch.NewHelper(&foundCluster, c.Client)
 		if err != nil {
 			return ctrl.Result{}, err
@@ -446,89 +440,18 @@ func (c *K0smotronController) reconcile(ctx context.Context, cluster *clusterv1.
 	return ctrl.Result{}, nil
 }
 
-// isClusterSpecSynced compares the Cluster specification in the K0smotronControlPlane with the one in the K0smotron Cluster and returns true if they are equal, false otherwise.
-// The comparison is done by first checking the hash of the specification stored in the annotation, if present. If the annotation is not present, it falls back to a deprecated
-// logic that compares the specs while ignoring the fields that are expected to be modified by the K0smotron Cluster controller.
-func isClusterSpecSynced(kmc kapi.Cluster, kcpSpec kapi.ClusterSpec) (isSynced bool, kcpSpecHash string, err error) {
+// isClusterSpecHashSynced reports whether the hash of the desired specification matches the one stored in the cluster-spec-hash annotation of the
+// K0smotron Cluster, which was generated from the desired specification at the time of the last update. A Cluster without the annotation is considered
+// out of date, so it gets reconciled once and the annotation is added. ExternalAddress is compared separately because the controller is expected to
+// update it after the creation of the Cluster, so it is not included in the hash.
+func isClusterSpecHashSynced(kmc kapi.Cluster, kcpSpec kapi.ClusterSpec) (isSynced bool, kcpSpecHash string) {
 	kcpSpecHash = generateClusterSpecHashWithoutExternalAddress(kcpSpec)
-	// Use the hash annotation if present, as it is the most reliable way to detect spec changes.
-	if clusterSpecHash, ok := kmc.GetAnnotations()[kapi.AnnotationKeyClusterSpecHash]; ok {
-		// Compare separately at the ExternalAddress because it is a field that is expected to be updated by the controller after the creation of the Cluster, so it is not
-		// included in the spec hash.
-		if kmc.Spec.ExternalAddress == kcpSpec.ExternalAddress {
-			// Cluster configuration is consider as synced if the hash of the desired specification matches the hash stored in the annotation in the cluster,
-			// which was generated based on the desired specification at the time the last update was made to the cluster.
-			if kcpSpecHash == clusterSpecHash {
-				return true, kcpSpecHash, nil
-			}
-		}
-
-		return false, kcpSpecHash, nil
+	clusterSpecHash, ok := kmc.GetAnnotations()[kapi.AnnotationKeyClusterSpecHash]
+	if !ok {
+		return false, kcpSpecHash
 	}
 
-	// Deprecated fallback logic: if the annotation is not present, we compare the specs while ignoring the fields that are expected to be modified
-	// by the K0smotron Cluster controller.
-	// TODO: Remove this logic in a future release once we are confident all existing clusters have the annotation available or at least we gave enough
-	// time for the annotation to be added in all clusters.
-
-	kmcSpec := kmc.Spec
-	overridenKmcSpec := kmcSpec.DeepCopy()
-	// The definition in K0smotronControlPlane takes precedence, as the K0smotron Cluster is created based on it. For this reason, mergo.WithOverride is
-	// used to ensure those values override existing ones.
-	err = mergo.Merge(overridenKmcSpec, kcpSpec, mergo.WithOverride)
-	if err != nil {
-		return false, kcpSpecHash, err
-	}
-	// K0smotron Cluster controller can add additional certificate references, such as 'apiserver-etcd-client'. Therefore, we explicitly reset the
-	// certificate references based on the original Cluster definition.
-	overridenKmcSpec.CertificateRefs = kmcSpec.CertificateRefs
-
-	// K0smotron Cluster controller will add additional a manifest for the endpoint configmap. Therefore, we explicitly add the manifest to avoid differences.
-	isEndpointConfigMapInManifests := false
-	for _, manifest := range overridenKmcSpec.Manifests {
-		if manifest.Name == kmc.GetEndpointConfigMapName() {
-			isEndpointConfigMapInManifests = true
-			break
-		}
-	}
-	if !isEndpointConfigMapInManifests {
-		overridenKmcSpec.Manifests = append(overridenKmcSpec.Manifests, v1.Volume{
-			Name: kmc.GetEndpointConfigMapName(),
-			VolumeSource: v1.VolumeSource{
-				ConfigMap: &v1.ConfigMapVolumeSource{
-					LocalObjectReference: v1.LocalObjectReference{
-						Name: kmc.GetEndpointConfigMapName(),
-					},
-				},
-			},
-		})
-	}
-	// K0smotron Cluster controller will add additional SANs, such as those related to the externaladdress or to the service that exposes the controlplanes.
-	// Therefore, we explicitly reset the SANs references based on the original Cluster definition.
-	if kmcSpec.K0sConfig != nil {
-		kmcSans, found, err := unstructured.NestedSlice(kmcSpec.K0sConfig.Object, "spec", "api", "sans")
-		if found && err == nil {
-			err = unstructured.SetNestedField(overridenKmcSpec.K0sConfig.Object, kmcSans, "spec", "api", "sans")
-			if err != nil {
-				return false, kcpSpecHash, fmt.Errorf("failed to set api.sans in K0smotronCluster spec: %w", err)
-			}
-		}
-
-		desiredK0sConfigName, found, err := unstructured.NestedString(overridenKmcSpec.K0sConfig.Object, "metadata", "name")
-		if found && err == nil {
-			k0sConfigName, found, err := unstructured.NestedString(kmcSpec.K0sConfig.Object, "metadata", "name")
-			if found && err == nil {
-				if desiredK0sConfigName != k0sConfigName {
-					err = unstructured.SetNestedField(overridenKmcSpec.K0sConfig.Object, k0sConfigName, "metadata", "name")
-					if err != nil {
-						return false, kcpSpecHash, fmt.Errorf("failed to set metadata.name in K0smotronCluster spec: %w", err)
-					}
-				}
-			}
-		}
-	}
-
-	return reflect.DeepEqual(kmcSpec, *overridenKmcSpec), kcpSpecHash, nil
+	return kmc.Spec.ExternalAddress == kcpSpec.ExternalAddress && kcpSpecHash == clusterSpecHash, kcpSpecHash
 }
 
 func ensureCertificates(ctx context.Context, cluster *clusterv1.Cluster, kcp *cpv1beta2.K0smotronControlPlane, scope *kmcScope) error {
